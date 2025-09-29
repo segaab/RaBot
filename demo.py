@@ -1033,4 +1033,3 @@ if run_full_pipeline_btn:
 # Chunk 8/8: final notes / help text
 
 st.sidebar.markdown("### Notes\n- Level thresholds adjust the breadth backtest behaviors.\n- Breadth returns per-level trade lists and summaries.\n- Save/Log model after a successful training run.\n\nIf you encounter pickling/export issues for L2 wrappers, consider defining module-level wrapper classes (L2Wrapper/L3Wrapper) instead of dynamic types.")
-```
