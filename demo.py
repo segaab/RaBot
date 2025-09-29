@@ -1,4 +1,3 @@
-# Chunk 1/8: imports + Streamlit UI + module-level wrappers + robust exporter
 import os
 import io
 import math
@@ -6,37 +5,36 @@ import time
 import uuid
 import json
 import joblib
+import pickle
 import logging
 import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Tuple, Dict, Any, Optional
-import concurrent.futures
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from dataclasses import dataclass
 
-# ML / metrics
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix, classification_report
+# sklearn
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-# Optional libs (graceful degradation)
+# optional libs
 try:
     from yahooquery import Ticker as YahooTicker
 except Exception:
     YahooTicker = None
+
 try:
     import xgboost as xgb
 except Exception:
     xgb = None
-try:
-    from supabase import create_client, Client
-except Exception:
-    create_client = None
-    Client = None
+
 try:
     import torch
     import torch.nn as nn
@@ -47,61 +45,648 @@ except Exception:
     optim = None
 
 # Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-logger = logging.getLogger("entry_triangulation_app")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("cascade_trader_app")
 logger.setLevel(logging.INFO)
 
-st.set_page_config(page_title="Entry-Range Triangulation", layout="wide")
-st.title("Entry-Range Triangulation Dashboard — Multi-level (3) Models")
+# Streamlit UI top-level
+st.set_page_config(page_title="Cascade Trader — Scope→Aim→Shoot", layout="wide")
+st.title("Cascade Trader — Scope → Aim → Shoot (L1/L2/L3)")
 
-# Module-level small wrapper classes for export pickling
-class L2Wrapper:
-    """Wrapper for L2 model export (xgboost or MLP)."""
-    def __init__(self):
-        self.booster = None  # xgboost.Booster or None
-        self.model = None    # torch model fallback
-        self.feature_names = []
+# --- Basic symbol/time inputs ---
+symbol = st.text_input("Symbol (Yahoo)", value="GC=F")
+start_date = st.date_input("Start date", value=datetime.today() - timedelta(days=90))
+end_date = st.date_input("End date", value=datetime.today())
+interval = st.selectbox("Interval", ["1d", "1h", "15m", "5m", "1m"], index=0)
 
-    def predict_proba(self, X: pd.DataFrame):
-        if self.booster is not None:
-            d = xgb.DMatrix(X[self.feature_names].fillna(0.0))
-            return self.booster.predict(d)
-        if self.model is not None:
-            self.model.eval()
+# --- Training & model settings ---
+st.sidebar.header("Training & Model")
+num_boost = int(st.sidebar.number_input("XGBoost rounds (if used)", min_value=1, value=200))
+early_stop = int(st.sidebar.number_input("Early stopping rounds", min_value=1, value=20))
+test_size = float(st.sidebar.number_input("Validation fraction", min_value=0.01, max_value=0.5, value=0.2))
+seq_len = int(st.sidebar.number_input("L1 sequence length", min_value=8, max_value=256, value=64, step=8))
+device_choice = st.sidebar.selectbox("Device", ["auto", "cpu", "cuda"], index=0)
+
+# --- Confirm thresholds used in quick sims ---
+st.sidebar.header("Quick sim thresholds")
+p_fast = st.sidebar.number_input("Confirm threshold (fast)", 0.0, 1.0, 0.60)
+p_slow = st.sidebar.number_input("Confirm threshold (slow)", 0.0, 1.0, 0.55)
+p_deep = st.sidebar.number_input("Confirm threshold (deep)", 0.0, 1.0, 0.45)
+
+# --- Level gating UI (explicit exclusive ranges) ---
+st.sidebar.header("Level gating (exclusive ranges) — signal scale 0..10")
+st.sidebar.markdown("Define explicit buy/sell ranges per level. Ranges should be exclusive (L3 inside L2 inside L1).")
+# L1
+lvl1_buy_min = st.sidebar.number_input("L1 buy min", 0.0, 10.0, 5.5, step=0.1)
+lvl1_buy_max = st.sidebar.number_input("L1 buy max", 0.0, 10.0, 9.9, step=0.1)
+lvl1_sell_min = st.sidebar.number_input("L1 sell min", 0.0, 10.0, 0.0, step=0.1)
+lvl1_sell_max = st.sidebar.number_input("L1 sell max", 0.0, 10.0, 4.5, step=0.1)
+# L2
+lvl2_buy_min = st.sidebar.number_input("L2 buy min", 0.0, 10.0, 6.0, step=0.1)
+lvl2_buy_max = st.sidebar.number_input("L2 buy max", 0.0, 10.0, 9.9, step=0.1)
+lvl2_sell_min = st.sidebar.number_input("L2 sell min", 0.0, 10.0, 0.0, step=0.1)
+lvl2_sell_max = st.sidebar.number_input("L2 sell max", 0.0, 10.0, 4.0, step=0.1)
+# L3
+lvl3_buy_min = st.sidebar.number_input("L3 buy min", 0.0, 10.0, 6.5, step=0.1)
+lvl3_buy_max = st.sidebar.number_input("L3 buy max", 0.0, 10.0, 9.9, step=0.1)
+lvl3_sell_min = st.sidebar.number_input("L3 sell min", 0.0, 10.0, 0.0, step=0.1)
+lvl3_sell_max = st.sidebar.number_input("L3 sell max", 0.0, 10.0, 3.5, step=0.1)
+
+# --- Breadth & sweep controls ---
+st.sidebar.header("Breadth & Sweep")
+run_breadth = st.sidebar.checkbox("Enable breadth backtest (on full run)", value=True)
+run_sweep = st.sidebar.checkbox("Enable grid sweep (on full run)", value=False)
+
+# One-button pipeline: fetch → candidates → train → export
+st.sidebar.header("Run pipeline")
+run_full_pipeline_btn = st.sidebar.button("Run full pipeline (fetch → train → export)")
+
+# Chunk 2/8: features, sequences, and dataset classes
+
+def compute_engineered_features(df: pd.DataFrame, windows=(5,10,20)) -> pd.DataFrame:
+    """Compute a compact set of engineered features from OHLCV."""
+    f = pd.DataFrame(index=df.index)
+    c = df['close'].astype(float)
+    h = df['high'].astype(float)
+    l = df['low'].astype(float)
+    v = df['volume'].astype(float) if 'volume' in df.columns else pd.Series(0.0, index=df.index)
+
+    ret1 = c.pct_change().fillna(0.0)
+    f['ret1'] = ret1
+    f['logret1'] = np.log1p(ret1.replace(-1, -0.999999))
+    tr = (h - l).clip(lower=0)
+    f['tr'] = tr.fillna(0.0)
+    for w in windows:
+        f[f'rmean_{w}'] = c.pct_change(w).fillna(0.0)
+        f[f'vol_{w}'] = ret1.rolling(w).std().fillna(0.0)
+        f[f'tr_mean_{w}'] = tr.rolling(w).mean().fillna(0.0)
+        f[f'vol_z_{w}'] = (v.rolling(w).mean() - v.rolling(max(1,w*3)).mean()).fillna(0.0)
+        f[f'mom_{w}'] = (c - c.rolling(w).mean()).fillna(0.0)
+        roll_max = c.rolling(w).max().fillna(method='bfill')
+        roll_min = c.rolling(w).min().fillna(method='bfill')
+        denom = (roll_max - roll_min).replace(0, np.nan)
+        f[f'chanpos_{w}'] = ((c - roll_min) / denom).fillna(0.5)
+    return f.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.ndarray:
+    """
+    Build sequences ending at each index t: [t-seq_len+1, ..., t]
+    Returns shape [N, seq_len, F]
+    """
+    Nrows, F = features.shape
+    X = np.zeros((len(indices), seq_len, F), dtype=features.dtype)
+    for i, t in enumerate(indices):
+        t = int(t)
+        t0 = t - seq_len + 1
+        if t0 < 0:
+            pad_count = -t0
+            pad = np.repeat(features[[0]], pad_count, axis=0)
+            seq = np.vstack([pad, features[0:t+1]])
+        else:
+            seq = features[t0:t+1]
+        if seq.shape[0] < seq_len:
+            pad_needed = seq_len - seq.shape[0]
+            pad = np.repeat(seq[[0]], pad_needed, axis=0)
+            seq = np.vstack([pad, seq])
+        X[i] = seq[-seq_len:]
+    return X
+
+# Dataset wrappers for torch
+if torch is not None:
+    from torch.utils.data import Dataset, DataLoader
+
+    class SequenceDataset(Dataset):
+        def __init__(self, X_seq: np.ndarray, y: np.ndarray):
+            self.X = X_seq.astype(np.float32)  # [N, T, F]
+            # model expects [B, F, T], we'll transpose in __getitem__
+            self.y = y.astype(np.float32).reshape(-1, 1)
+        def __len__(self): return len(self.X)
+        def __getitem__(self, idx):
+            x = self.X[idx].transpose(1,0)  # [F, T]
+            y = self.y[idx]
+            return x, y
+
+    class TabDataset(Dataset):
+        def __init__(self, X: np.ndarray, y: np.ndarray):
+            self.X = X.astype(np.float32)
+            self.y = y.astype(np.float32).reshape(-1, 1)
+        def __len__(self): return len(self.X)
+        def __getitem__(self, idx):
+            return self.X[idx], self.y[idx]
+else:
+    # Provide no-op placeholders to avoid NameError in non-train flows
+    SequenceDataset = None
+    TabDataset = None
+
+# Chunk 3/8: candidate generation, simulation and summarization
+
+def ensure_unique_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None: return df
+    if df.index.duplicated().any():
+        df = df[~df.index.duplicated(keep="first")]
+    return df.sort_index()
+
+def _true_range(high, low, close):
+    prev_close = close.shift(1).fillna(close.iloc[0])
+    tr = pd.concat([high-low, (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+    return tr
+
+def generate_candidates_and_labels(
+    bars: pd.DataFrame,
+    lookback: int = 64,
+    k_tp: float = 3.0,
+    k_sl: float = 1.0,
+    atr_window: int = 14,
+    max_bars: int = 60,
+    direction: str = "long"
+) -> pd.DataFrame:
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+    bars = bars.copy()
+    bars.index = pd.to_datetime(bars.index)
+    for col in ("high","low","close"):
+        if col not in bars.columns:
+            raise KeyError(f"Missing column {col}")
+    bars["tr"] = _true_range(bars["high"], bars["low"], bars["close"])
+    bars["atr"] = bars["tr"].rolling(atr_window, min_periods=1).mean()
+    records = []
+    n = len(bars)
+    for i in range(lookback, n):
+        t = bars.index[i]
+        entry_px = float(bars["close"].iat[i])
+        atr_val = float(bars["atr"].iat[i])
+        if atr_val <= 0 or math.isnan(atr_val):
+            continue
+        sl_px = entry_px - k_sl*atr_val if direction=="long" else entry_px + k_sl*atr_val
+        tp_px = entry_px + k_tp*atr_val if direction=="long" else entry_px - k_tp*atr_val
+        end_i = min(i+max_bars, n-1)
+        label, hit_i, hit_px = 0, end_i, float(bars["close"].iat[end_i])
+        for j in range(i+1, end_i+1):
+            hi, lo = float(bars["high"].iat[j]), float(bars["low"].iat[j])
+            if direction=="long":
+                if hi >= tp_px:
+                    label, hit_i, hit_px = 1, j, tp_px; break
+                if lo <= sl_px:
+                    label, hit_i, hit_px = 0, j, sl_px; break
+            else:
+                if lo <= tp_px:
+                    label, hit_i, hit_px = 1, j, tp_px; break
+                if hi >= sl_px:
+                    label, hit_i, hit_px = 0, j, sl_px; break
+        end_t = bars.index[hit_i]
+        ret_val = (hit_px-entry_px)/entry_px if direction=="long" else (entry_px-hit_px)/entry_px
+        dur_min = (end_t - t).total_seconds()/60.0
+        records.append(dict(candidate_time=t,
+                            entry_price=entry_px,
+                            atr=float(atr_val),
+                            sl_price=float(sl_px),
+                            tp_price=float(tp_px),
+                            end_time=end_t,
+                            label=int(label),
+                            duration=float(dur_min),
+                            realized_return=float(ret_val),
+                            direction=direction))
+    return pd.DataFrame(records)
+
+def simulate_limits(df: pd.DataFrame,
+                    bars: pd.DataFrame,
+                    label_col: str = "pred_label",
+                    symbol: str = "GC=F",
+                    sl: float = 0.02,
+                    tp: float = 0.04,
+                    max_holding: int = 60) -> pd.DataFrame:
+    if df is None or df.empty or bars is None or bars.empty:
+        return pd.DataFrame()
+    trades = []
+    bars = bars.copy(); bars.index = pd.to_datetime(bars.index)
+    for _, row in df.iterrows():
+        lbl = row.get(label_col, 0)
+        if lbl == 0 or pd.isna(lbl):
+            continue
+        entry_t = pd.to_datetime(row.get("candidate_time", row.name))
+        if entry_t not in bars.index:
+            continue
+        entry_px = float(bars.loc[entry_t, "close"])
+        direction = 1 if lbl > 0 else -1
+        sl_px = entry_px * (1 - sl) if direction > 0 else entry_px * (1 + sl)
+        tp_px = entry_px * (1 + tp) if direction > 0 else entry_px * (1 - tp)
+        exit_t, exit_px, pnl = None, None, None
+        segment = bars.loc[entry_t:].head(max_holding)
+        if segment.empty:
+            continue
+        for t, b in segment.iterrows():
+            lo, hi = float(b["low"]), float(b["high"])
+            if direction > 0:
+                if lo <= sl_px:
+                    exit_t, exit_px, pnl = t, sl_px, -sl; break
+                if hi >= tp_px:
+                    exit_t, exit_px, pnl = t, tp_px, tp; break
+            else:
+                if hi >= sl_px:
+                    exit_t, exit_px, pnl = t, sl_px, -sl; break
+                if lo <= tp_px:
+                    exit_t, exit_px, pnl = t, tp_px, tp; break
+        if exit_t is None:
+            last_bar = segment.iloc[-1]
+            exit_t = last_bar.name
+            exit_px = float(last_bar["close"])
+            pnl = (exit_px - entry_px)/entry_px * direction
+        trades.append(dict(symbol=symbol,
+                           entry_time=entry_t,
+                           entry_price=entry_px,
+                           direction=direction,
+                           exit_time=exit_t,
+                           exit_price=exit_px,
+                           pnl=float(pnl)))
+    return pd.DataFrame(trades)
+
+def summarize_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    total_trades = len(trades)
+    win_rate = float((trades["pnl"] > 0).mean())
+    avg_pnl = float(trades["pnl"].mean())
+    median_pnl = float(trades["pnl"].median())
+    total_pnl = float(trades["pnl"].sum())
+    max_dd = float(trades["pnl"].cumsum().min())
+    start_time = trades["entry_time"].min()
+    end_time = trades["exit_time"].max()
+    return pd.DataFrame([{
+        "total_trades": total_trades,
+        "win_rate": win_rate,
+        "avg_pnl": avg_pnl,
+        "median_pnl": median_pnl,
+        "total_pnl": total_pnl,
+        "max_drawdown": max_dd,
+        "start_time": start_time,
+        "end_time": end_time
+    }])
+
+# Chunk 4/8: model building blocks and temperature scaler
+
+if torch is None:
+    # We'll still allow non-training flows, but training button should error early.
+    logger.warning("Torch not available — training disabled. Install torch to enable cascade training.")
+
+else:
+    class ConvBlock(nn.Module):
+        def __init__(self, c_in, c_out, k, d, pdrop):
+            super().__init__()
+            pad = (k - 1) * d // 2
+            self.conv = nn.Conv1d(c_in, c_out, kernel_size=k, dilation=d, padding=pad)
+            self.bn = nn.BatchNorm1d(c_out)
+            self.act = nn.ReLU()
+            self.drop = nn.Dropout(pdrop)
+            self.res = (c_in == c_out)
+        def forward(self, x):
+            out = self.conv(x); out = self.bn(out); out = self.act(out); out = self.drop(out)
+            if self.res: out = out + x
+            return out
+
+    class Level1ScopeCNN(nn.Module):
+        def __init__(self, in_features=12, channels=(32,64,128), kernel_sizes=(5,3,3), dilations=(1,2,4), dropout=0.1):
+            super().__init__()
+            chs = [in_features] + list(channels)
+            blocks = []
+            for i in range(len(channels)):
+                k = kernel_sizes[min(i, len(kernel_sizes)-1)]
+                d = dilations[min(i, len(dilations)-1)]
+                blocks.append(ConvBlock(chs[i], chs[i+1], k, d, dropout))
+            self.blocks = nn.Sequential(*blocks)
+            self.project = nn.Conv1d(chs[-1], chs[-1], kernel_size=1)
+            self.head = nn.Linear(chs[-1], 1)
+        @property
+        def embedding_dim(self): return int(self.blocks[-1].conv.out_channels)
+        def forward(self, x):
+            z = self.blocks(x)
+            z = self.project(z)
+            z_pool = z.mean(dim=-1)
+            logit = self.head(z_pool)
+            return logit, z_pool
+
+    class MLP(nn.Module):
+        def __init__(self, in_dim, hidden, out_dim=1, dropout=0.1):
+            super().__init__()
+            layers = []
+            last = in_dim
+            for h in hidden:
+                layers += [nn.Linear(last, h), nn.ReLU(), nn.Dropout(dropout)]
+                last = h
+            layers += [nn.Linear(last, out_dim)]
+            self.net = nn.Sequential(*layers)
+        def forward(self, x): return self.net(x)
+
+    class Level3ShootMLP(nn.Module):
+        def __init__(self, in_dim, hidden=(128,64), dropout=0.1, use_regression_head=True):
+            super().__init__()
+            self.backbone = MLP(in_dim, list(hidden), out_dim=128, dropout=dropout)
+            self.cls_head = nn.Linear(128, 1)
+            self.reg_head = nn.Linear(128, 1) if use_regression_head else None
+        def forward(self, x):
+            h = self.backbone(x)
+            logit = self.cls_head(h)
+            ret = self.reg_head(h) if self.reg_head is not None else None
+            return logit, ret
+
+    class TemperatureScaler(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.log_temp = nn.Parameter(torch.zeros(1))
+        def forward(self, logits):
+            T = torch.exp(self.log_temp)
+            return logits / T
+        def fit(self, logits: np.ndarray, y: np.ndarray, max_iter=200, lr=1e-2):
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.to(device)
+            logits_t = torch.tensor(logits.reshape(-1,1), dtype=torch.float32, device=device)
+            y_t = torch.tensor(y.reshape(-1,1), dtype=torch.float32, device=device)
+            opt = torch.optim.LBFGS(self.parameters(), lr=lr, max_iter=max_iter)
+            bce = nn.BCEWithLogitsLoss()
+            def closure():
+                opt.zero_grad()
+                scaled = self.forward(logits_t)
+                loss = bce(scaled, y_t)
+                loss.backward()
+                return loss
+            try:
+                opt.step(closure)
+            except Exception as e:
+                logger.warning("Temp scaler LBFGS failed: %s", e)
+        def transform(self, logits: np.ndarray) -> np.ndarray:
             with torch.no_grad():
-                Xt = torch.tensor(X.values.astype(np.float32))
-                logits = self.model(Xt).numpy().reshape(-1)
-                return 1.0 / (1.0 + np.exp(-logits))
-        return np.zeros(len(X))
+                device = next(self.parameters()).device
+                logits_t = torch.tensor(logits.reshape(-1,1), dtype=torch.float32, device=device)
+                scaled = self.forward(logits_t).cpu().numpy()
+            return scaled.reshape(-1)
 
-    def feature_importance(self) -> pd.DataFrame:
-        if self.booster is not None:
-            imp = self.booster.get_score(importance_type="gain")
-            return pd.DataFrame([(k, float(imp.get(k, 0.0))) for k in self.feature_names],
-                                columns=["feature", "gain"]).sort_values("gain", ascending=False)
-        return pd.DataFrame([{"feature": "none", "gain": 0.0}])
+# Chunk 5/8: training helpers and CascadeTrader (fit + predict)
 
-class L3Wrapper:
-    """Wrapper for L3 model export (torch)."""
-    def __init__(self):
-        self.model = None
-        self.input_features = []
+def _device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
 
-    def predict_proba(self, X: pd.DataFrame):
-        if self.model is None:
-            return np.zeros(len(X))
-        self.model.eval()
+def train_torch_classifier(model: nn.Module,
+                           train_ds,
+                           val_ds,
+                           lr: float = 1e-3,
+                           epochs: int = 10,
+                           patience: int = 3,
+                           pos_weight: float = 1.0,
+                           device: str = "auto"):
+    dev = _device(device)
+    model = model.to(dev)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    pos_weight_t = torch.tensor([pos_weight], device=dev)
+    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
+    tr_loader = torch.utils.data.DataLoader(train_ds, batch_size=getattr(train_ds, "batch_size", 128), shuffle=True)
+    va_loader = torch.utils.data.DataLoader(val_ds, batch_size=getattr(val_ds, "batch_size", 1024), shuffle=False)
+    best_loss = float("inf"); best_state = None; no_imp = 0
+    history = {"train": [], "val": []}
+    for ep in range(epochs):
+        model.train()
+        running_loss = 0.0; n = 0
+        for xb, yb in tr_loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            opt.zero_grad()
+            out = model(xb)
+            logit = out[0] if isinstance(out, tuple) else out
+            loss = bce(logit, yb)
+            loss.backward()
+            opt.step()
+            running_loss += float(loss.item()) * xb.size(0)
+            n += xb.size(0)
+        train_loss = running_loss / max(1, n)
+        # val
+        model.eval()
+        vloss = 0.0; vn = 0
         with torch.no_grad():
-            Xt = torch.tensor(X.values.astype(np.float32))
-            logits, _ = self.model(Xt)
-            probs = torch.sigmoid(logits).cpu().numpy().reshape(-1)
-            return probs
+            for xb, yb in va_loader:
+                xb, yb = xb.to(dev), yb.to(dev)
+                out = model(xb)
+                logit = out[0] if isinstance(out, tuple) else out
+                loss = bce(logit, yb)
+                vloss += float(loss.item()) * xb.size(0)
+                vn += xb.size(0)
+        val_loss = vloss / max(1, vn)
+        history["train"].append(train_loss); history["val"].append(val_loss)
+        if val_loss + 1e-8 < best_loss:
+            best_loss = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            no_imp = 0
+        else:
+            no_imp += 1
+            if no_imp >= patience:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {"best_val_loss": best_loss, "history": history}
 
-    def feature_importance(self) -> pd.DataFrame:
-        # For neural networks we fallback to empty / placeholder
-        return pd.DataFrame([{"feature": f, "gain": 0.0} for f in self.input_features])
+class CascadeTrader:
+    def __init__(self, seq_len: int = 64, feat_windows=(5,10,20), device: str = "auto"):
+        if torch is None:
+            raise RuntimeError("Torch required for CascadeTrader")
+        self.seq_len = seq_len
+        self.feat_windows = feat_windows
+        self.device = _device(device)
+        self.scaler_seq = StandardScaler()
+        self.scaler_tab = StandardScaler()
+        self.l1 = None
+        self.l1_temp = TemperatureScaler()
+        self.l2_backend = None
+        self.l2_model = None
+        self.l3 = None
+        self.l3_temp = TemperatureScaler()
+        self.tab_feature_names = []
+        self._fitted = False
+        self.metadata = {}
 
-# Use the robust exporter you provided (kept verbatim with logging)
+    def fit(self, df: pd.DataFrame, events: pd.DataFrame, l2_use_xgb: bool = True, epochs_l1: int = 10, epochs_l23: int = 10):
+        """
+        Fit the cascade on df using events (columns 't' indices and 'y' labels).
+        Training does:
+          - compute features
+          - build sequences and tabular
+          - train L1 (CNN)
+          - build embeddings + tabular matrix
+          - train L2 (xgb/MLP) and L3 (MLP) in parallel
+        """
+        t0 = time.time()
+        df = ensure_unique_index(df)
+        eng = compute_engineered_features(df, windows=self.feat_windows)
+        seq_cols = ['open','high','low','close','volume']
+        # pick micro columns present
+        micro_cols = [c for c in ['ret1','tr','vol_5','mom_5','chanpos_10'] if c in eng.columns or c in df.columns]
+        # build feature frames
+        feat_seq_df = pd.concat([df[seq_cols].astype(float), eng[[c for c in micro_cols if c in eng.columns]]], axis=1, sort=False).fillna(0.0)
+        feat_tab_df = eng.fillna(0.0)
+        self.tab_feature_names = list(feat_tab_df.columns)
+        # prepare event indices and labels
+        idx = events['t'].astype(int).values
+        y = events['y'].astype(int).values
+        # time-based or stratified split: here we do stratified for simplicity
+        tr_idx, va_idx = train_test_split(np.arange(len(idx)), test_size=test_size, random_state=42, stratify=y)
+        idx_tr, idx_va = idx[tr_idx], idx[va_idx]
+        y_tr, y_va = y[tr_idx], y[va_idx]
+        # fit scalers on training positions
+        X_seq_all = feat_seq_df.values
+        self.scaler_seq.fit(X_seq_all[idx_tr])
+        X_seq_all_scaled = self.scaler_seq.transform(X_seq_all)
+        X_tab_all = feat_tab_df.values
+        self.scaler_tab.fit(X_tab_all[idx_tr])
+        X_tab_all_scaled = self.scaler_tab.transform(X_tab_all)
+        # build sequences
+        Xseq_tr = to_sequences(X_seq_all_scaled, idx_tr, seq_len=self.seq_len)
+        Xseq_va = to_sequences(X_seq_all_scaled, idx_va, seq_len=self.seq_len)
+        # datasets
+        ds_l1_tr = SequenceDataset(Xseq_tr, y_tr)
+        ds_l1_va = SequenceDataset(Xseq_va, y_va)
+        ds_l1_tr.batch_size = 128
+        ds_l1_va.batch_size = 256
+        # init L1 with correct in_features
+        in_features = Xseq_tr.shape[2]
+        self.l1 = Level1ScopeCNN(in_features=in_features, channels=(32,64,128), kernel_sizes=(5,3,3), dilations=(1,2,4), dropout=0.1)
+        self.l1, l1_hist = train_torch_classifier(self.l1, ds_l1_tr, ds_l1_va, lr=1e-3, epochs=epochs_l1, patience=3, pos_weight=1.0, device=str(self.device))
+        # infer L1 embeddings for full event set
+        all_idx_seq = to_sequences(X_seq_all_scaled, idx, seq_len=self.seq_len)
+        l1_logits, l1_emb = self._l1_infer_logits_emb(all_idx_seq)
+        # split embedding arrays to train/val
+        l1_emb_tr, l1_emb_va = l1_emb[tr_idx], l1_emb[va_idx]
+        Xtab_tr = X_tab_all_scaled[idx_tr]; Xtab_va = X_tab_all_scaled[idx_va]
+        X_l2_tr = np.hstack([l1_emb_tr, Xtab_tr]); X_l2_va = np.hstack([l1_emb_va, Xtab_va])
+        # Train L2 (xgb if available and requested) and L3 in parallel
+        results = {}
+        def do_l2_xgb():
+            if xgb is None:
+                raise RuntimeError("xgboost not installed")
+            clf = xgb.XGBClassifier(n_estimators=num_boost, max_depth=5, learning_rate=0.05, use_label_encoder=False, eval_metric="logloss")
+            clf.fit(X_l2_tr, y_tr, eval_set=[(X_l2_va, y_va)], verbose=False)
+            return ("xgb", clf)
+        def do_l2_mlp():
+            in_dim = X_l2_tr.shape[1]
+            m = MLP(in_dim, [128,64], out_dim=1, dropout=0.1)
+            ds2_tr = TabDataset(X_l2_tr, y_tr)
+            ds2_va = TabDataset(X_l2_va, y_va)
+            ds2_tr.batch_size = 256; ds2_va.batch_size = 512
+            m, hist = train_torch_classifier(m, ds2_tr, ds2_va, lr=1e-3, epochs=epochs_l23, patience=3, pos_weight=1.0, device=str(self.device))
+            return ("mlp", m)
+        def do_l3():
+            in_dim = X_l2_tr.shape[1]
+            m3 = Level3ShootMLP(in_dim, hidden=(128,64), dropout=0.1, use_regression_head=True)
+            ds3_tr = TabDataset(X_l2_tr, y_tr)
+            ds3_va = TabDataset(X_l2_va, y_va)
+            ds3_tr.batch_size = 256; ds3_va.batch_size = 512
+            m3, hist3 = train_torch_classifier(m3, ds3_tr, ds3_va, lr=1e-3, epochs=epochs_l23, patience=3, pos_weight=1.0, device=str(self.device))
+            return ("l3", (m3, hist3))
+        futures = {}
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            if (xgb is not None) and l2_use_xgb:
+                futures[ex.submit(do_l2_xgb)] = "l2"
+            else:
+                futures[ex.submit(do_l2_mlp)] = "l2"
+            futures[ex.submit(do_l3)] = "l3"
+            for fut in as_completed(futures):
+                label = futures[fut]
+                try:
+                    results[label] = fut.result()
+                except Exception as e:
+                    logger.exception("Parallel train error for %s: %s", label, e)
+                    results[label] = None
+        # attach L2/L3
+        if results.get("l2") is not None:
+            self.l2_backend, self.l2_model = results["l2"]
+        if results.get("l3") is not None:
+            # results["l3"] == ("l3", (m3, hist3))
+            self.l3 = results["l3"][1][0] if isinstance(results["l3"][1], tuple) else results["l3"][1]
+        # calibrate temperature scalers (best-effort)
+        try:
+            self.l1_temp.fit(l1_logits.reshape(-1,1), y)
+        except Exception as e:
+            logger.warning("L1 temperature scaling failed: %s", e)
+        try:
+            l3_val_logits = self._l3_infer_logits(X_l2_va)
+            self.l3_temp.fit(l3_val_logits.reshape(-1,1), y_va)
+        except Exception as e:
+            logger.warning("L3 temperature scaling failed: %s", e)
+        self.metadata = {"l1_hist": l1_hist, "fit_time_sec": round(time.time() - t0, 2), "l2_backend": self.l2_backend}
+        self._fitted = True
+        logger.info("CascadeTrader.fit finished in %.2fs", time.time() - t0)
+        return self
+
+    def _l1_infer_logits_emb(self, Xseq: np.ndarray):
+        self.l1.eval()
+        logits = []; embeds = []
+        batch = 256
+        with torch.no_grad():
+            for i in range(0, len(Xseq), batch):
+                sub = Xseq[i:i+batch]
+                xb = torch.tensor(sub.transpose(0,2,1), dtype=torch.float32, device=self.device)  # [B, F, T]
+                logit, emb = self.l1(xb)
+                logits.append(logit.detach().cpu().numpy())
+                embeds.append(emb.detach().cpu().numpy())
+        return np.concatenate(logits, axis=0).reshape(-1,1), np.concatenate(embeds, axis=0)
+
+    def _l3_infer_logits(self, X: np.ndarray):
+        self.l3.eval()
+        logits = []
+        batch = 2048
+        with torch.no_grad():
+            for i in range(0, len(X), batch):
+                xb = torch.tensor(X[i:i+batch], dtype=torch.float32, device=self.device)
+                logit, _ = self.l3(xb)
+                logits.append(logit.detach().cpu().numpy())
+        return np.concatenate(logits, axis=0).reshape(-1,1)
+
+    def _mlp_predict_proba(self, model: nn.Module, X: np.ndarray) -> np.ndarray:
+        model.eval()
+        probs = []
+        batch = 4096
+        with torch.no_grad():
+            for i in range(0, len(X), batch):
+                xb = torch.tensor(X[i:i+batch], dtype=torch.float32, device=self.device)
+                logit = model(xb)
+                p = torch.sigmoid(logit).cpu().numpy().reshape(-1)
+                probs.append(p)
+        return np.concatenate(probs, axis=0)
+
+    def predict_batch(self, df: pd.DataFrame, t_indices: np.ndarray) -> pd.DataFrame:
+        assert self._fitted, "CascadeTrader not fitted"
+        eng = compute_engineered_features(df, windows=self.feat_windows)
+        seq_cols = ['open','high','low','close','volume']; micro_cols=['ret1','tr','vol_5','mom_5','chanpos_10']
+        use_cols = [c for c in seq_cols + micro_cols if c in list(df.columns) + list(eng.columns)]
+        feat_seq_df = pd.concat([df[seq_cols].astype(float), eng[[c for c in micro_cols if c in eng.columns]]], axis=1)[use_cols].fillna(0.0)
+        feat_tab_df = eng[self.tab_feature_names].fillna(0.0)
+        X_seq_all_scaled = self.scaler_seq.transform(feat_seq_df.values)
+        X_tab_all_scaled = self.scaler_tab.transform(feat_tab_df.values)
+        Xseq = to_sequences(X_seq_all_scaled, t_indices, seq_len=self.seq_len)
+        l1_logits, l1_emb = self._l1_infer_logits_emb(Xseq)
+        l1_logits_scaled = self.l1_temp.transform(l1_logits.reshape(-1,1)).reshape(-1)
+        p1 = 1.0/(1.0+np.exp(-l1_logits_scaled))
+        go2 = p1 >= 0.30
+        X_l2 = np.hstack([l1_emb, X_tab_all_scaled[t_indices]])
+        if self.l2_backend == "xgb":
+            try:
+                p2 = self.l2_model.predict_proba(X_l2)[:,1]
+            except Exception:
+                p2 = np.zeros(len(X_l2))
+        else:
+            p2 = self._mlp_predict_proba(self.l2_model, X_l2)
+        go3 = (p2 >= 0.55) & go2
+        p3 = np.zeros_like(p1); rhat = np.zeros_like(p1)
+        if go3.any() and self.l3 is not None:
+            X_l3 = X_l2[go3]
+            l3_logits = self._l3_infer_logits(X_l3)
+            l3_logits_scaled = self.l3_temp.transform(l3_logits.reshape(-1,1)).reshape(-1)
+            p3_vals = 1.0/(1.0+np.exp(-l3_logits_scaled))
+            p3[go3] = p3_vals
+            rhat[go3] = p3_vals - 0.5
+        trade = (p3 >= 0.65) & go3
+        size = np.clip(rhat, 0.0, None) * trade.astype(float)
+        return pd.DataFrame({"t": t_indices, "p1": p1, "p2": p2, "p3": p3, "go2": go2.astype(int), "go3": go3.astype(int), "trade": trade.astype(int), "size": size})
+
+
+# Chunk 6/8: export_model_and_metadata (user-provided) + breadth and sweep helpers
+
 def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: Dict[str,Any], model_basename: str, save_fi: bool = True):
     """
     Save model artifacts and a portable .pt bundle for each model_wrapper.
@@ -115,7 +700,7 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
             model_file = f"{model_basename}_{ts}.model"
             try:
                 logger.info(f"Exporting native model file to {model_file}")
-                model_wrapper.save_model(model_file) if hasattr(model_wrapper, "save_model") else model_wrapper.booster.save_model(model_file)
+                model_wrapper.save_model(model_file)
                 paths["model"] = model_file
                 logger.info(f"Successfully saved native model file to {model_file}")
             except Exception as e:
@@ -155,29 +740,21 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
         try:
             logger.info(f"Preparing to save .pt bundle to {pt_path}")
             payload = {"model_wrapper": model_wrapper, "features": feature_list, "metrics": metrics, "export_log": []}
-
-            # Add initial log entry
             payload["export_log"].append(f"[{datetime.utcnow().isoformat()}] Starting export of .pt bundle")
-
-            # Check torch availability
             if 'torch' in globals() and torch is not None:
                 payload["export_log"].append(f"[{datetime.utcnow().isoformat()}] Using torch.save for .pt export")
                 torch.save(payload, pt_path)
             else:
                 payload["export_log"].append(f"[{datetime.utcnow().isoformat()}] torch not available, using joblib for .pt export")
                 joblib.dump(payload, pt_path)
-
-            # Add success log entry
             payload["export_log"].append(f"[{datetime.utcnow().isoformat()}] Successfully saved .pt bundle")
-
             paths["pt"] = pt_path
             logger.info(f"Successfully saved .pt bundle to {pt_path}")
         except Exception as e:
             error_msg = f"Failed to save .pt payload: {str(e)}\n{traceback.format_exc()}"
             logger.error(error_msg)
             paths["pt_error"] = error_msg
-
-            # Try fallback with more detailed error logging
+            # fallback
             fallback = f"{model_basename}_{ts}_fallback.pt"
             try:
                 logger.info(f"Attempting joblib fallback to {fallback}")
@@ -204,7 +781,6 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
         logger.exception(error_msg)
         paths["export_error"] = error_msg
 
-    # Final validation of PT file
     if "pt" in paths:
         try:
             logger.info(f"Verifying .pt bundle at {paths['pt']}")
@@ -219,515 +795,41 @@ def export_model_and_metadata(model_wrapper, feature_list: List[str], metrics: D
             verification_error = f"PT verification failed: {str(e)}"
             logger.error(verification_error)
             paths["pt_verification_error"] = verification_error
-
     return paths
 
-# Chunk 2/8: fetching + rvol + health gauge + index helpers
-
-def fetch_price(symbol: str, start: Optional[str] = None, end: Optional[str] = None, interval: str = "1d") -> pd.DataFrame:
-    """YahooQuery OHLCV fetcher returning a tidy DataFrame."""
-    logger.info("fetch_price: symbol=%s start=%s end=%s interval=%s", symbol, start, end, interval)
-    if YahooTicker is None:
-        logger.error("yahooquery missing.")
-        return pd.DataFrame()
-    try:
-        tq = YahooTicker(symbol)
-        raw = tq.history(start=start, end=end, interval=interval)
-        if raw is None:
-            logger.warning("fetch_price returned no data")
-            return pd.DataFrame()
-        if isinstance(raw, dict):
-            raw = pd.DataFrame(raw)
-        if isinstance(raw.index, pd.MultiIndex):
-            raw = raw.reset_index(level=0, drop=True)
-        raw.index = pd.to_datetime(raw.index)
-        raw = raw.sort_index()
-        raw.columns = [c.lower() for c in raw.columns]
-        if "close" not in raw.columns and "adjclose" in raw.columns:
-            raw["close"] = raw["adjclose"]
-        raw = raw[~raw.index.duplicated(keep="first")]
-        logger.info("fetch_price: returned %d rows", len(raw))
-        return raw
-    except Exception as exc:
-        logger.exception("fetch_price failed: %s", exc)
-        return pd.DataFrame()
-
-def compute_rvol(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series([], dtype=float)
-    if "volume" not in df.columns:
-        # fallback constant
-        return pd.Series(1.0, index=df.index)
-    rolling = df["volume"].rolling(window=lookback, min_periods=1).mean()
-    r = (df["volume"] / rolling.replace(0, np.nan)).fillna(1.0)
-    return r
-
-def calculate_health_gauge(cot_df: pd.DataFrame, daily_bars: pd.DataFrame, threshold: float = 1.5) -> pd.DataFrame:
-    if daily_bars is None or daily_bars.empty:
-        return pd.DataFrame()
-    db = daily_bars.copy()
-    db["rvol"] = compute_rvol(db)
-    db["health_gauge"] = (db["rvol"] >= threshold).astype(float)
-    return db[["health_gauge"]]
-
-def ensure_unique_index(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None:
-        return df
-    df = df.copy()
-    if df.index.duplicated().any():
-        df = df[~df.index.duplicated(keep="first")]
-    return df.sort_index()
-
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode()
-
-# Chunk 3/8: candidate generation & labeling (fixed tp_px expression)
-
-def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev_close = close.shift(1).fillna(close.iloc[0])
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr
-
-def generate_candidates_and_labels(bars: pd.DataFrame,
-                                   lookback: int = 64,
-                                   k_tp: float = 3.0,
-                                   k_sl: float = 1.0,
-                                   atr_window: int = 14,
-                                   max_bars: int = 60,
-                                   direction: str = "long") -> pd.DataFrame:
-    """
-    ATR-based TP/SL labeling. Ensures tp_px expression is correct.
-    """
-    if bars is None or bars.empty:
-        logger.warning("generate_candidates_and_labels: empty bars")
-        return pd.DataFrame()
-    bars = bars.copy()
-    bars.index = pd.to_datetime(bars.index)
-    bars = ensure_unique_index(bars)
-    for col in ("high", "low", "close"):
-        if col not in bars.columns:
-            raise KeyError(f"Missing column {col}")
-    bars["tr"] = _true_range(bars["high"], bars["low"], bars["close"])
-    bars["atr"] = bars["tr"].rolling(window=atr_window, min_periods=1).mean()
-
-    recs = []
-    n = len(bars)
-    for i in range(lookback, n):
-        t = bars.index[i]
-        entry_px = float(bars["close"].iat[i])
-        atr = float(bars["atr"].iat[i])
-        if atr <= 0 or math.isnan(atr):
-            continue
-
-        if direction == "long":
-            sl_px = entry_px - k_sl * atr
-            tp_px = entry_px + k_tp * atr
-        else:
-            sl_px = entry_px + k_sl * atr
-            tp_px = entry_px - k_tp * atr
-
-        end_idx = min(i + max_bars, n - 1)
-        label = 0
-        hit_idx = end_idx
-        hit_px = float(bars["close"].iat[end_idx])
-
-        for j in range(i + 1, end_idx + 1):
-            hi = float(bars["high"].iat[j]); lo = float(bars["low"].iat[j])
-            if direction == "long":
-                if hi >= tp_px:
-                    label, hit_idx, hit_px = 1, j, tp_px
-                    break
-                if lo <= sl_px:
-                    label, hit_idx, hit_px = 0, j, sl_px
-                    break
-            else:
-                if lo <= tp_px:
-                    label, hit_idx, hit_px = 1, j, tp_px
-                    break
-                if hi >= sl_px:
-                    label, hit_idx, hit_px = 0, j, sl_px
-                    break
-
-        end_t = bars.index[hit_idx]
-        realized_return = (hit_px - entry_px) / entry_px if direction == "long" else (entry_px - hit_px) / entry_px
-        dur_min = (end_t - t).total_seconds() / 60.0
-
-        recs.append({
-            "candidate_time": t,
-            "entry_price": float(entry_px),
-            "atr": float(atr),
-            "sl_price": float(sl_px),
-            "tp_price": float(tp_px),
-            "end_time": end_t,
-            "label": int(label),
-            "duration": float(dur_min),
-            "realized_return": float(realized_return),
-            "direction": direction
-        })
-    df_recs = pd.DataFrame(recs)
-    logger.info("generate_candidates_and_labels: generated %d candidates", len(df_recs))
-    return df_recs
-
-# Chunk 4/8: simulate_limits + summaries
-
-def simulate_limits(df: pd.DataFrame,
-                    bars: pd.DataFrame,
-                    label_col: str = "pred_label",
-                    symbol: str = "GC=F",
-                    sl: float = 0.02,
-                    tp: float = 0.04,
-                    max_holding: int = 60) -> pd.DataFrame:
-    if df is None or df.empty or bars is None or bars.empty:
-        logger.warning("simulate_limits: empty inputs")
-        return pd.DataFrame()
-    trades = []
-    bars = bars.copy()
-    bars.index = pd.to_datetime(bars.index)
-    for _, row in df.iterrows():
-        lbl = row.get(label_col, 0)
-        if lbl == 0 or pd.isna(lbl):
-            continue
-        entry_t = pd.to_datetime(row.get("candidate_time", row.name))
-        if entry_t not in bars.index:
-            continue
-        entry_px = float(bars.loc[entry_t, "close"])
-        direction = 1 if lbl > 0 else -1
-        sl_px = entry_px * (1 - sl) if direction > 0 else entry_px * (1 + sl)
-        tp_px = entry_px * (1 + tp) if direction > 0 else entry_px * (1 - tp)
-        exit_t, exit_px, pnl = None, None, None
-        segment = bars.loc[entry_t:].head(max_holding)
-        if segment.empty:
-            continue
-        for t, b in segment.iterrows():
-            lo, hi = float(b["low"]), float(b["high"])
-            if direction > 0:
-                if lo <= sl_px:
-                    exit_t, exit_px, pnl = t, sl_px, -sl
-                    break
-                if hi >= tp_px:
-                    exit_t, exit_px, pnl = t, tp_px, tp
-                    break
-            else:
-                if hi >= sl_px:
-                    exit_t, exit_px, pnl = t, sl_px, -sl
-                    break
-                if lo <= tp_px:
-                    exit_t, exit_px, pnl = t, tp_px, tp
-                    break
-        if exit_t is None:
-            last_bar = segment.iloc[-1]
-            exit_t = last_bar.name
-            exit_px = float(last_bar["close"])
-            pnl = (exit_px - entry_px) / entry_px * direction
-        trades.append({
-            "symbol": symbol,
-            "entry_time": entry_t,
-            "entry_price": entry_px,
-            "direction": direction,
-            "exit_time": exit_t,
-            "exit_price": exit_px,
-            "pnl": float(pnl)
-        })
-    df_trades = pd.DataFrame(trades)
-    logger.info("simulate_limits: %d trades generated", len(df_trades))
-    return df_trades
-
-def summarize_trades(trades: pd.DataFrame) -> pd.DataFrame:
-    if trades is None or trades.empty:
-        return pd.DataFrame()
-    total_trades = len(trades)
-    win_rate = float((trades["pnl"] > 0).mean())
-    avg_pnl = float(trades["pnl"].mean())
-    median_pnl = float(trades["pnl"].median())
-    total_pnl = float(trades["pnl"].sum())
-    max_dd = float(trades["pnl"].cumsum().min())
-    start_time = trades["entry_time"].min()
-    end_time = trades["exit_time"].max()
-    return pd.DataFrame([{
-        "total_trades": total_trades,
-        "win_rate": win_rate,
-        "avg_pnl": avg_pnl,
-        "median_pnl": median_pnl,
-        "total_pnl": total_pnl,
-        "max_drawdown": max_dd,
-        "start_time": start_time,
-        "end_time": end_time
-    }])
-
-def combine_summaries(results: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    rows = []
-    for mode, trades_df in results.items():
-        if trades_df is None or trades_df.empty:
-            continue
-        s = summarize_trades(trades_df)
+def run_breadth_levels(preds: pd.DataFrame, cands: pd.DataFrame, bars: pd.DataFrame) -> Dict[str,Any]:
+    """Apply exclusive level ranges to preds -> cands and simulate trades per level."""
+    out = {"detailed": {}, "summary": []}
+    df = cands.copy().reset_index(drop=True)
+    # Map preds.t -> df rows (assume aligned as used earlier)
+    preds_indexed = preds.set_index('t')
+    df['signal'] = (preds_indexed.reindex(df.index)['p3'].fillna(0.0) * 10).values
+    def run_level(name, buy_min, buy_max, sl_pct, rr):
+        sel = df[(df['signal'] >= buy_min) & (df['signal'] <= buy_max)].copy()
+        tp_pct = rr * sl_pct
+        if sel.empty:
+            out['detailed'][name] = pd.DataFrame()
+            return
+        sel['pred_label'] = (sel['signal'] >= buy_min).astype(int)  # simple mapping
+        trades = simulate_limits(sel, bars, label_col='pred_label', sl=sl_pct, tp=tp_pct, max_holding=60)
+        out['detailed'][name] = trades
+        s = summarize_trades(trades)
         if not s.empty:
-            s["mode"] = mode
-            rows.append(s)
-    if not rows:
-        return pd.DataFrame()
-    return pd.concat(rows, ignore_index=True)
-
-# Chunk 5/8: BoosterWrapper + train_xgb_confirm (expanded metrics) + predict_confirm_prob
-
-class BoosterWrapper:
-    def __init__(self, booster: xgb.Booster, feature_names: List[str]):
-        self.booster = booster
-        self.feature_names = feature_names
-        self.best_iteration = getattr(booster, "best_iteration", None)
-
-    def _dmatrix(self, X: pd.DataFrame):
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X, columns=self.feature_names)
-        Xp = X.reindex(columns=self.feature_names).fillna(0.0)
-        return xgb.DMatrix(Xp, feature_names=self.feature_names)
-
-    def predict_proba(self, X: pd.DataFrame) -> pd.Series:
-        d = self._dmatrix(X)
-        if self.best_iteration is not None:
-            raw = self.booster.predict(d, iteration_range=(0, int(self.best_iteration) + 1))
-        else:
-            raw = self.booster.predict(d)
-        raw = np.asarray(raw, dtype=float)
-        return pd.Series(raw, index=X.index, name="confirm_proba")
-
-    def predict(self, X: pd.DataFrame) -> pd.Series:
-        proba = self.predict_proba(X)
-        return (proba >= 0.5).astype(int)
-
-    def save_model(self, path: str):
-        try:
-            self.booster.save_model(path)
-        except Exception:
-            joblib.dump({"booster": self.booster, "feature_names": self.feature_names}, path)
-
-    def feature_importance(self) -> pd.DataFrame:
-        try:
-            importance = self.booster.get_score(importance_type="gain")
-            df = pd.DataFrame([(k, importance.get(k, 0.0)) for k in self.feature_names],
-                              columns=["feature", "importance"]).sort_values("importance", ascending=False)
-            return df.reset_index(drop=True)
-        except Exception:
-            return pd.DataFrame([(f, 0.0) for f in self.feature_names], columns=["feature", "importance"])
-
-def train_xgb_confirm(clean: pd.DataFrame,
-                      feature_cols: List[str],
-                      label_col: str = "label",
-                      num_boost_round: int = 200,
-                      early_stopping_rounds: int = 20,
-                      test_size: float = 0.2,
-                      random_state: int = 42,
-                      verbose: bool = False) -> (BoosterWrapper, Dict[str,Any]):
-    if xgb is None:
-        raise RuntimeError("xgboost not installed")
-
-    missing = [c for c in feature_cols if c not in clean.columns]
-    if missing:
-        raise KeyError(f"Missing feature columns in training data: {missing}")
-
-    X_all = clean[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    y_all = pd.to_numeric(clean[label_col], errors="coerce").astype(int)
-
-    mask = X_all.replace([np.inf, -np.inf], np.nan).notnull().all(axis=1) & y_all.notnull()
-    X_all = X_all.loc[mask].reset_index(drop=True)
-    y_all = y_all.loc[mask].reset_index(drop=True)
-
-    if len(X_all) < 10 or y_all.nunique() < 2:
-        raise ValueError("Not enough data or not both classes present for training")
-
-    X_train, X_val, y_train, y_val = train_test_split(X_all, y_all, test_size=test_size, random_state=random_state, stratify=y_all)
-
-    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_cols)
-    dval = xgb.DMatrix(X_val, label=y_val, feature_names=feature_cols)
-
-    params = {
-        "objective": "binary:logistic",
-        "eta": 0.05,
-        "max_depth": 6,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "eval_metric": "logloss",
-        "verbosity": 0,
-        "scale_pos_weight": float((y_train == 0).sum()) / max(1, float((y_train == 1).sum()))
-    }
-
-    t0 = time.time()
-    bst = xgb.train(params, dtrain, num_boost_round=num_boost_round, evals=[(dval, "validation")],
-                    early_stopping_rounds=early_stopping_rounds, verbose_eval=verbose)
-    fit_time = time.time() - t0
-
-    wrapper = BoosterWrapper(bst, feature_cols)
-
-    # Metrics
-    y_proba_val = wrapper.predict_proba(X_val)
-    y_pred_val = (y_proba_val >= 0.5).astype(int)
-
-    acc = float(accuracy_score(y_val, y_pred_val))
-    f1 = float(f1_score(y_val, y_pred_val, zero_division=0))
-    try:
-        roc = float(roc_auc_score(y_val, y_proba_val))
-    except Exception:
-        roc = float("nan")
-
-    cm = confusion_matrix(y_val, y_pred_val).tolist()
-    creport = classification_report(y_val, y_pred_val, zero_division=0, output_dict=False)
-
-    metrics = {
-        "fit_time_sec": round(fit_time, 4),
-        "n_train": int(len(X_train)),
-        "n_val": int(len(X_val)),
-        "accuracy": acc,
-        "f1": f1,
-        "roc_auc": roc,
-        "confusion_matrix": cm,
-        "classification_report": creport
-    }
-
-    logger.info("train_xgb_confirm: metrics=%s", metrics)
-    return wrapper, metrics
-
-def predict_confirm_prob(model, df: pd.DataFrame, feature_cols: List[str]) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    missing = [c for c in feature_cols if c not in df.columns]
-    for m in missing:
-        df[m] = 0.0
-    try:
-        if hasattr(model, "predict_proba"):
-            return model.predict_proba(df[feature_cols])
-        elif hasattr(model, "predict"):
-            preds = model.predict(df[feature_cols])
-            return pd.Series(preds, index=df.index, name="confirm_proba")
-        else:
-            return pd.Series(np.zeros(len(df)), index=df.index, name="confirm_proba")
-    except Exception as exc:
-        logger.exception("predict_confirm_prob failed: %s", exc)
-        return pd.Series(np.zeros(len(df)), index=df.index, name="confirm_proba")
-
-# Chunk 6/8: run_breadth_backtest + run_grid_sweep (with optional per-level concurrent training)
-
-def run_breadth_backtest(clean: pd.DataFrame,
-                         bars: pd.DataFrame,
-                         levels_config: Dict[str, Dict[str, Any]],
-                         feature_cols: List[str],
-                         model_train_kwargs: Dict[str,Any],
-                         train_per_level: bool = False,
-                         concurrent_workers: int = 3) -> Dict[str, Any]:
-    """
-    For each level in levels_config produce trades. Optionally retrain a confirm model per level.
-    Returns standardized dict with summaries, per-level trades, metrics and export paths.
-    """
-    out = {"summary": [], "detailed_trades": {}, "metrics": {}, "export_paths": {}, "diagnostics": []}
-    if clean is None or clean.empty:
-        out["diagnostics"].append("No candidate set provided.")
-        return out
-
-    # Prepare thread pool if requested
-    executor = None
-    if train_per_level:
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_workers)
-        futures = {}
-
-    for lvl_name, cfg in levels_config.items():
-        try:
-            buy_th = float(cfg.get("buy_th"))
-            sell_th = float(cfg.get("sell_th"))
-            rr_min = float(cfg.get("rr_min"))
-            rr_max = float(cfg.get("rr_max"))
-            sl_min = float(cfg.get("sl_min"))
-            sl_max = float(cfg.get("sl_max"))
-
-            df = clean.copy()
-
-            if "signal" not in df.columns:
-                if "pred_prob" in df.columns:
-                    df["signal"] = (df["pred_prob"] * 10).round().astype(int)
-                else:
-                    df["signal"] = 0
-
-            df["pred_label"] = 0
-            df.loc[df["signal"] > buy_th, "pred_label"] = 1
-            df.loc[df["signal"] < sell_th, "pred_label"] = -1
-
-            sl_pct = float((sl_min + sl_max) / 2.0)
-            rr = float((rr_min + rr_max) / 2.0)
-            tp_pct = rr * sl_pct
-
-            # Optionally retrain per-level on filtered df where label in {0,1}
-            if train_per_level:
-                # spawn training in thread using filtered positives/negatives
-                df_train = df[df["label"].isin([0,1])].reset_index(drop=True)
-                if df_train.shape[0] >= 20:
-                    future = executor.submit(train_xgb_confirm, df_train, feature_cols,
-                                             model_train_kwargs.get("label_col", "label"),
-                                             int(model_train_kwargs.get("num_boost_round", 200)),
-                                             int(model_train_kwargs.get("early_stopping_rounds", 20)),
-                                             float(model_train_kwargs.get("test_size", 0.2)),
-                                             int(model_train_kwargs.get("random_state", 42)),
-                                             False)
-                    futures[lvl_name] = future
-                else:
-                    out["diagnostics"].append(f"{lvl_name}: not enough rows to train per-level model ({len(df_train)})")
-                    futures[lvl_name] = None
-            else:
-                # Use existing pred_label and no retrain
-                trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
-                out["detailed_trades"][lvl_name] = trades
-                if not trades.empty:
-                    s = summarize_trades(trades)
-                    out["summary"].append(s.iloc[0].to_dict())
-                out["diagnostics"].append(f"{lvl_name}: simulated {len(trades)} trades, sl={sl_pct:.4f}, tp={tp_pct:.4f}")
-
-        except Exception as exc:
-            logger.exception("Breadth level %s failed: %s", lvl_name, exc)
-            out["diagnostics"].append(f"{lvl_name} error: {exc}")
-
-    # Wait for training futures and if present, simulate and export
-    if train_per_level and futures:
-        for lvl_name, fut in futures.items():
-            try:
-                if fut is None:
-                    continue
-                model_wrap, metrics = fut.result(timeout=600)
-                out["metrics"][lvl_name] = metrics
-                # Build a wrapper for export
-                wrapper = L2Wrapper()
-                wrapper.booster = model_wrap.booster if hasattr(model_wrap, "booster") else None
-                wrapper.feature_names = model_wrap.feature_names if hasattr(model_wrap, "feature_names") else feature_cols
-                # simulate using model's predicted probs
-                df_local = clean.copy()
-                df_local["pred_prob"] = predict_confirm_prob(wrapper, df_local, feature_cols)
-                df_local["pred_label"] = (df_local["pred_prob"] >= model_train_kwargs.get("mpt", 0.6)).astype(int)
-                sl_pct = float((levels_config[lvl_name]["sl_min"] + levels_config[lvl_name]["sl_max"]) / 2.0)
-                rr = float((levels_config[lvl_name]["rr_min"] + levels_config[lvl_name]["rr_max"]) / 2.0)
-                tp_pct = rr * sl_pct
-                trades = simulate_limits(df_local, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
-                out["detailed_trades"][lvl_name] = trades
-                if not trades.empty:
-                    s = summarize_trades(trades)
-                    out["summary"].append(s.iloc[0].to_dict())
-
-                # Export model
-                model_basename = f"confirm_{lvl_name}_{uuid.uuid4().hex[:8]}"
-                paths = export_model_and_metadata(model_wrap, feature_cols, metrics, model_basename, save_fi=True)
-                out["export_paths"][lvl_name] = paths
-                out["diagnostics"].append(f"{lvl_name}: trained & exported, trades={len(trades)}")
-            except Exception as exc:
-                logger.exception("Per-level training failed for %s: %s", lvl_name, exc)
-                out["diagnostics"].append(f"{lvl_name} training error: {exc}")
-
-    if executor:
-        executor.shutdown(wait=False)
+            row = s.iloc[0].to_dict(); row['mode'] = name; out['summary'].append(row)
+    # apply L1/L2/L3 with sl/rr defaults from UI if present
+    # default sl & rr values if the UI didn't include them (safe fallback)
+    l1_sl = float((globals().get("lvl1_sl_min",0.02) + globals().get("lvl1_sl_max",0.04))/2.0)
+    l1_rr = float((globals().get("lvl1_rr_min",2.0) + globals().get("lvl1_rr_max",2.5))/2.0)
+    l2_sl = float((globals().get("lvl2_sl_min",0.01) + globals().get("lvl2_sl_max",0.03))/2.0)
+    l2_rr = float((globals().get("lvl2_rr_min",2.0) + globals().get("lvl2_rr_max",3.5))/2.0)
+    l3_sl = float((globals().get("lvl3_sl_min",0.005) + globals().get("lvl3_sl_max",0.02))/2.0)
+    l3_rr = float((globals().get("lvl3_rr_min",3.0) + globals().get("lvl3_rr_max",5.0))/2.0)
+    run_level("L1", lvl1_buy_min, lvl1_buy_max, l1_sl, l1_rr)
+    run_level("L2", lvl2_buy_min, lvl2_buy_max, l2_sl, l2_rr)
+    run_level("L3", lvl3_buy_min, lvl3_buy_max, l3_sl, l3_rr)
     return out
 
-def run_grid_sweep(clean: pd.DataFrame,
-                   bars: pd.DataFrame,
-                   rr_vals: List[float],
-                   sl_ranges: List[Tuple[float,float]],
-                   mpt_list: List[float],
-                   feature_cols: List[str],
-                   model_train_kwargs: Dict[str,Any]) -> Dict[str, Any]:
+def run_grid_sweep(clean: pd.DataFrame, bars: pd.DataFrame, rr_vals: List[float], sl_ranges: List[Tuple[float,float]], mpt_list: List[float]) -> Dict[str,Any]:
     results = {}
     if clean is None or clean.empty:
         return results
@@ -740,294 +842,198 @@ def run_grid_sweep(clean: pd.DataFrame,
                 try:
                     df = clean.copy()
                     if "pred_prob" not in df.columns:
-                        if "signal" in df.columns:
-                            df["pred_prob"] = (df["signal"] / 10.0).clip(0.0, 1.0)
-                        else:
-                            df["pred_prob"] = 0.0
+                        df["pred_prob"] = 0.0
                     df["pred_label"] = (df["pred_prob"] >= mpt).astype(int)
-                    trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=int(model_train_kwargs.get("max_bars", 60)))
-                    results[key] = {"trades_count": len(trades), "overlay": trades}
+                    trades = simulate_limits(df, bars, label_col="pred_label", sl=sl_pct, tp=tp_pct, max_holding=60)
+                    results[key] = {"trades_count": len(trades), "trades": trades}
                 except Exception as exc:
                     logger.exception("Sweep config %s failed: %s", key, exc)
                     results[key] = {"error": str(exc)}
     return results
 
-# Chunk 7/8: Supabase logger + helpers + pick_top_runs_by_metrics
 
-class SupabaseLogger:
-    def __init__(self):
-        if create_client is None:
-            raise RuntimeError("supabase client not installed")
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        if not url or not key:
-            raise ValueError("SUPABASE env vars missing")
-        self.client = create_client(url, key)
-        self.runs_tbl = "entry_runs"
-        self.trades_tbl = "entry_trades"
+# Chunk 7/8: Streamlit actions including one-button run_full_pipeline
 
-    def log_run(self, metrics: Dict, metadata: Dict, trades: Optional[List[Dict]] = None) -> str:
-        run_id = metadata.get("run_id") or str(uuid.uuid4())
-        metadata["run_id"] = run_id
-        payload = {**metadata, "metrics": metrics}
-        resp = self.client.table(self.runs_tbl).insert(payload).execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Failed to insert run: {resp.error}")
-        if trades:
-            for t in trades:
-                t["run_id"] = run_id
-            tr_resp = self.client.table(self.trades_tbl).insert(trades).execute()
-            if getattr(tr_resp, "error", None):
-                raise RuntimeError(f"Failed to insert trades: {tr_resp.error}")
-        return run_id
+# session state containers
+if "bars" not in st.session_state: st.session_state.bars = pd.DataFrame()
+if "cands" not in st.session_state: st.session_state.cands = pd.DataFrame()
+if "trader" not in st.session_state: st.session_state.trader = None
+if "export_paths" not in st.session_state: st.session_state.export_paths = {}
 
-    def fetch_runs(self, symbol: Optional[str] = None, limit: int = 50):
-        q = self.client.table(self.runs_tbl)
-        if symbol:
-            q = q.eq("symbol", symbol)
-        resp = q.order("start_date", desc=True).limit(limit).execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Failed to fetch runs: {resp.error}")
-        return getattr(resp, "data", [])
-
-    def fetch_trades(self, run_id: str):
-        resp = self.client.table(self.trades_tbl).select("*").eq("run_id", run_id).execute()
-        if getattr(resp, "error", None):
-            raise RuntimeError(f"Failed to fetch trades: {resp.error}")
-        return getattr(resp, "data", [])
-
-def pick_top_runs_by_metrics(runs: List[Dict], top_n: int = 3):
-    scored = []
-    for r in runs:
-        metrics = r.get("metrics") if isinstance(r, dict) else r
-        total_pnl = metrics.get("total_pnl", 0.0) if metrics else 0.0
-        win_rate = metrics.get("win_rate", 0.0) if metrics else 0.0
-        score = float(total_pnl) + float(win_rate) * 0.01
-        scored.append((score, r))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [item[1] for item in scored[:top_n]]
-
-# Chunk 8/8: main pipeline + handlers (fetch → features → label → train → backtest → export)
-
-# --- UI controls (kept / extended)
-st.sidebar.header("HealthGauge")
-buy_threshold_global = st.sidebar.number_input("Global buy threshold (signal scale 0-10)", 0.0, 10.0, 5.5)
-sell_threshold_global = st.sidebar.number_input("Global sell threshold (signal scale 0-10)", 0.0, 10.0, 4.5)
-force_run = st.sidebar.checkbox("Force run even if gating fails", value=False)
-
-st.sidebar.header("Training / Export")
-num_boost = int(st.sidebar.number_input("XGBoost rounds", min_value=1, value=200))
-early_stop = int(st.sidebar.number_input("Early stopping rounds", min_value=1, value=20))
-test_size = float(st.sidebar.number_input("Validation fraction", min_value=0.01, max_value=0.5, value=0.2))
-train_per_level = st.sidebar.checkbox("Train per-level confirm models (concurrent)", value=False)
-concurrent_workers = int(st.sidebar.number_input("Concurrent workers (if per-level)", 1, 8, 3))
-
-st.sidebar.header("Confirm thresholds")
-p_fast = st.sidebar.number_input("Confirm threshold (fast)", 0.0, 1.0, 0.60)
-p_slow = st.sidebar.number_input("Confirm threshold (slow)", 0.0, 1.0, 0.55)
-p_deep = st.sidebar.number_input("Confirm threshold (deep)", 0.0, 1.0, 0.45)
-
-st.sidebar.header("Levels (explicit min/max scope)")
-# Level 1
-lvl1_buy_min = st.sidebar.number_input("L1 buy min", 0.0, 10.0, 5.5)
-lvl1_buy_max = st.sidebar.number_input("L1 buy max", 0.0, 10.0, 6.0)
-lvl1_sell_min = st.sidebar.number_input("L1 sell min", 0.0, 10.0, 4.5)
-lvl1_sell_max = st.sidebar.number_input("L1 sell max", 0.0, 10.0, 5.0)
-lvl1_rr_min = st.sidebar.number_input("L1 RR min", 0.1, 10.0, 1.0)
-lvl1_rr_max = st.sidebar.number_input("L1 RR max", 0.1, 10.0, 2.5)
-lvl1_sl_min = st.sidebar.number_input("L1 SL min (pct)", 0.001, 0.5, 0.02)
-lvl1_sl_max = st.sidebar.number_input("L1 SL max (pct)", 0.001, 0.5, 0.04)
-
-# Level 2
-lvl2_buy_min = st.sidebar.number_input("L2 buy min", 0.0, 10.0, 6.0)
-lvl2_buy_max = st.sidebar.number_input("L2 buy max", 0.0, 10.0, 6.5)
-lvl2_sell_min = st.sidebar.number_input("L2 sell min", 0.0, 10.0, 4.0)
-lvl2_sell_max = st.sidebar.number_input("L2 sell max", 0.0, 10.0, 4.5)
-lvl2_rr_min = st.sidebar.number_input("L2 RR min", 0.1, 10.0, 2.0)
-lvl2_rr_max = st.sidebar.number_input("L2 RR max", 0.1, 10.0, 3.5)
-lvl2_sl_min = st.sidebar.number_input("L2 SL min (pct)", 0.001, 0.5, 0.01)
-lvl2_sl_max = st.sidebar.number_input("L2 SL max (pct)", 0.001, 0.5, 0.03)
-
-# Level 3
-lvl3_buy_min = st.sidebar.number_input("L3 buy min", 0.0, 10.0, 6.5)
-lvl3_buy_max = st.sidebar.number_input("L3 buy max", 0.0, 10.0, 7.5)
-lvl3_sell_min = st.sidebar.number_input("L3 sell min", 0.0, 10.0, 3.5)
-lvl3_sell_max = st.sidebar.number_input("L3 sell max", 0.0, 10.0, 4.0)
-lvl3_rr_min = st.sidebar.number_input("L3 RR min", 0.1, 10.0, 3.0)
-lvl3_rr_max = st.sidebar.number_input("L3 RR max", 0.1, 10.0, 5.0)
-lvl3_sl_min = st.sidebar.number_input("L3 SL min (pct)", 0.001, 0.5, 0.005)
-lvl3_sl_max = st.sidebar.number_input("L3 SL max (pct)", 0.001, 0.5, 0.02)
-
-# Buttons
-run_full = st.button("Run full pipeline (fetch → features → candidates → train → backtest → export)")
-run_breadth = st.button("Run breadth backtest (3 levels only)")
-run_sweep = st.button("Run grid sweep (RR x SL x MPT)")
-
-# defaults
-feat_cols_default = ["atr", "rvol", "duration", "hg"]
-
-def _assemble_levels_config():
-    return {
-        "L1": {"buy_th": (lvl1_buy_min + lvl1_buy_max)/2.0, "sell_th": (lvl1_sell_min + lvl1_sell_max)/2.0,
-               "rr_min": lvl1_rr_min, "rr_max": lvl1_rr_max, "sl_min": lvl1_sl_min, "sl_max": lvl1_sl_max},
-        "L2": {"buy_th": (lvl2_buy_min + lvl2_buy_max)/2.0, "sell_th": (lvl2_sell_min + lvl2_sell_max)/2.0,
-               "rr_min": lvl2_rr_min, "rr_max": lvl2_rr_max, "sl_min": lvl2_sl_min, "sl_max": lvl2_sl_max},
-        "L3": {"buy_th": (lvl3_buy_min + lvl3_buy_max)/2.0, "sell_th": (lvl3_sell_min + lvl3_sell_max)/2.0,
-               "rr_min": lvl3_rr_min, "rr_max": lvl3_rr_max, "sl_min": lvl3_sl_min, "sl_max": lvl3_sl_max},
-    }
-
-def run_main_pipeline_and_export():
-    st.info("Starting full pipeline...")
+def fetch_and_prepare():
+    st.info(f"Fetching {symbol} {interval} from YahooQuery …")
+    bars = pd.DataFrame()
+    if YahooTicker is None:
+        st.error("yahooquery not installed — cannot fetch price data.")
+        return pd.DataFrame()
     try:
-        bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
-        if bars is None or bars.empty:
-            st.error("No price data returned.")
-            return
-        bars = ensure_unique_index(bars)
-        # compute rvol and attach
-        bars["rvol"] = compute_rvol(bars, lookback=20)
-        daily = bars.resample("1D").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
-        health = calculate_health_gauge(None, daily)
-        latest_health = float(health["health_gauge"].iloc[-1]) if not health.empty else 0.0
-        st.metric("Latest HealthGauge", f"{latest_health:.3f}")
+        tq = YahooTicker(symbol)
+        raw = tq.history(start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
+        if raw is None:
+            st.error("No data returned from yahooquery.")
+            return pd.DataFrame()
+        if isinstance(raw, dict): raw = pd.DataFrame(raw)
+        if isinstance(raw.index, pd.MultiIndex): raw = raw.reset_index(level=0, drop=True)
+        raw.index = pd.to_datetime(raw.index)
+        raw = raw.sort_index()
+        raw.columns = [c.lower() for c in raw.columns]
+        if "close" not in raw.columns and "adjclose" in raw.columns:
+            raw["close"] = raw["adjclose"]
+        bars = raw[~raw.index.duplicated(keep="first")]
+        st.success(f"Fetched {len(bars)} bars.")
+    except Exception as e:
+        logger.exception("Fetch failed: %s", e)
+        st.error(f"Fetch failed: {e}")
+    return bars
 
-        if not (latest_health >= buy_threshold_global or latest_health <= sell_threshold_global or force_run):
-            st.warning("Health gating prevented run. Use 'Force run' to override.")
-            return
-
-        # generate candidates
-        cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
-        if cands is None or cands.empty:
-            st.error("No candidates generated.")
-            return
-
-        # ensure rvol mapped into candidates
-        if "rvol" not in cands.columns:
-            # map via candidate_time to bar rvol
-            cands["rvol"] = cands["candidate_time"].map(lambda t: bars["rvol"].get(pd.to_datetime(t), np.nan))
-        cands["rvol"] = cands["rvol"].fillna(1.0)
-
-        # health gauge
-        if not health.empty:
-            hg_map = health["health_gauge"].reindex(pd.to_datetime(health.index)).ffill().to_dict()
-            cands["hg"] = cands["candidate_time"].dt.normalize().map(lambda t: hg_map.get(pd.Timestamp(t).normalize(), 0.0))
-        else:
-            cands["hg"] = 0.0
-
-        feat_cols = ["atr", "rvol", "duration", "hg"]
-        # filter labels
-        clean = cands.dropna(subset=["label"]).query("label in [0,1]").reset_index(drop=True)
-        if clean.empty:
-            st.error("No labelled candidates for training.")
-            return
-
-        # Train main confirm model (single model)
-        st.info("Training confirm-stage XGBoost model (main pipeline)...")
-        model_wrap, metrics = train_xgb_confirm(clean, feat_cols, label_col="label",
-                                                num_boost_round=num_boost, early_stopping_rounds=early_stop,
-                                                test_size=test_size, random_state=42, verbose=False)
-        st.subheader("Training metrics")
-        st.json(metrics)
-
-        # predict and simulate
-        clean["pred_prob"] = predict_confirm_prob(model_wrap, clean, feat_cols)
-        clean["pred_label"] = (clean["pred_prob"] >= p_fast).astype(int)
-        trades = simulate_limits(clean, bars, label_col="pred_label", max_holding=60)
-        st.write("Simulated trades:", len(trades))
-        if not trades.empty:
-            st.dataframe(trades.head())
-            s = summarize_trades(trades)
-            st.dataframe(s)
-
-        # Export main model
-        model_basename = f"confirm_main_{symbol.replace('=','_')}"
-        paths_main = export_model_and_metadata(model_wrap, feat_cols, metrics, model_basename, save_fi=True)
-        st.success(f"Exported main model: {paths_main}")
-
-        # Optionally run breadth per-level with per-level training & export
-        levels_cfg = _assemble_levels_config()
-        if train_per_level or st.checkbox("Also run breadth backtest + per-level export now", value=False):
-            st.info("Running breadth backtest with per-level training & export...")
-            res = run_breadth_backtest(clean=clean, bars=bars, levels_config=levels_cfg,
-                                      feature_cols=feat_cols,
-                                      model_train_kwargs={"num_boost_round": num_boost, "early_stopping_rounds": early_stop, "test_size": test_size, "max_bars": 60, "mpt": p_fast},
-                                      train_per_level=train_per_level,
-                                      concurrent_workers=concurrent_workers)
-            st.subheader("Breadth diagnostics")
-            st.write(res.get("diagnostics", []))
-            if res.get("summary"):
-                st.subheader("Breadth summary")
-                st.dataframe(pd.DataFrame(res["summary"]))
-            if res.get("export_paths"):
-                st.subheader("Per-level export paths")
-                st.json(res["export_paths"])
-
-        st.success("Full pipeline complete.")
-    except Exception as exc:
-        logger.exception("Pipeline failed: %s", exc)
-        st.error(f"Pipeline failed: {exc}")
-
-if run_full:
-    run_main_pipeline_and_export()
-
-# Breadth-only button (uses same candidate generation)
-if run_breadth:
+def run_full_pipeline():
+    # 1) fetch
+    bars = fetch_and_prepare()
+    if bars is None or bars.empty:
+        return {"error": "No bars"}
+    st.session_state.bars = bars
+    bars = ensure_unique_index(bars)
+    # 2) compute rvol and candidates
     try:
-        bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
-        bars = ensure_unique_index(bars)
-        bars["rvol"] = compute_rvol(bars, 20)
-        cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
-        if cands is None or cands.empty:
-            st.error("No candidates available for breadth run.")
+        bars["rvol"] = (bars["volume"] / bars["volume"].rolling(20, min_periods=1).mean()).fillna(1.0)
+    except Exception:
+        bars["rvol"] = 1.0
+    cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
+    if cands is None or cands.empty:
+        st.warning("No candidates generated.")
+        st.session_state.cands = pd.DataFrame()
+        return {"error": "No candidates"}
+    # add placeholder pred_prob column for sim if needed
+    cands["pred_prob"] = 0.0
+    st.session_state.cands = cands
+    st.success(f"Generated {len(cands)} candidates.")
+    # 3) map candidate_time to integer positions for events
+    bar_idx_map = {t: i for i, t in enumerate(bars.index)}
+    cand_idx = []
+    for t in cands["candidate_time"]:
+        t0 = pd.Timestamp(t)
+        if t0 in bar_idx_map:
+            cand_idx.append(bar_idx_map[t0])
         else:
-            # ensure rvol/hg
-            cands["rvol"] = cands["candidate_time"].map(lambda t: bars["rvol"].get(pd.to_datetime(t), np.nan)).fillna(1.0)
-            levels_cfg = _assemble_levels_config()
-            res = run_breadth_backtest(clean=cands, bars=bars, levels_config=levels_cfg,
-                                      feature_cols=feat_cols_default, model_train_kwargs={"max_bars": 60, "mpt": p_fast},
-                                      train_per_level=train_per_level, concurrent_workers=concurrent_workers)
-            st.subheader("Breadth diagnostics")
-            st.write(res.get("diagnostics", []))
-            if res.get("summary"):
-                st.subheader("Breadth summary")
-                st.dataframe(pd.DataFrame(res["summary"]))
-    except Exception as exc:
-        logger.exception("Breadth failed: %s", exc)
-        st.error(f"Breadth failed: {exc}")
-
-# Sweep button
-if run_sweep:
+            locs = bars.index[bars.index <= t0]
+            cand_idx.append(int(bar_idx_map[locs[-1]] if len(locs) else 0))
+    events = pd.DataFrame({"t": np.array(cand_idx, dtype=int), "y": cands["label"].astype(int).values})
+    # 4) train cascade
+    if torch is None:
+        st.error("Torch not installed — cannot train cascade.")
+        return {"error": "no_torch"}
+    st.info("Training cascade (L1/L2/L3). This may take a while.")
+    trader = CascadeTrader(seq_len=seq_len, feat_windows=(5,10,20), device=device_choice)
     try:
-        bars = fetch_price(symbol, start=start_date.isoformat(), end=end_date.isoformat(), interval=interval)
-        bars = ensure_unique_index(bars)
-        bars["rvol"] = compute_rvol(bars, 20)
-        cands = generate_candidates_and_labels(bars, k_tp=2.0, k_sl=1.0, atr_window=14, max_bars=60)
-        if cands is None or cands.empty:
-            st.error("No candidates for sweep.")
+        trader.fit(bars, events, l2_use_xgb=(xgb is not None), epochs_l1=8, epochs_l23=8)
+        st.success("Cascade trained.")
+        st.session_state.trader = trader
+    except Exception as e:
+        logger.exception("Cascade training failed: %s", e)
+        st.error(f"Cascade training failed: {e}")
+        return {"error": "train_failed", "exception": str(e)}
+    # 5) predict on candidate indices and breadth/backtest & optional sweep
+    t_indices = np.array(cand_idx, dtype=int)
+    preds = trader.predict_batch(bars, t_indices)
+    st.write("Predictions head:")
+    st.dataframe(preds.head(10))
+    # breadth
+    if run_breadth:
+        st.info("Running breadth backtest")
+        res = run_breadth_levels(preds, cands, bars)
+        st.session_state.last_breadth = res
+        if res["summary"]:
+            st.subheader("Breadth summary")
+            st.dataframe(pd.DataFrame(res["summary"]))
         else:
-            cands["rvol"] = cands["candidate_time"].map(lambda t: bars["rvol"].get(pd.to_datetime(t), np.nan)).fillna(1.0)
-            rr_vals = sorted(list(set([lvl1_rr_min, lvl1_rr_max, lvl2_rr_min, lvl2_rr_max, lvl3_rr_min, lvl3_rr_max])))
-            sl_ranges = [(lvl1_sl_min, lvl1_sl_max), (lvl2_sl_min, lvl2_sl_max), (lvl3_sl_min, lvl3_sl_max)]
-            mpt_list = [p_fast, p_slow, p_deep]
-            sweep_results = run_grid_sweep(clean=cands, bars=bars, rr_vals=rr_vals, sl_ranges=sl_ranges, mpt_list=mpt_list,
-                                          feature_cols=feat_cols_default, model_train_kwargs={"max_bars": 60})
-            summary_rows = []
-            for k, v in sweep_results.items():
-                if isinstance(v, dict) and "overlay" in v and not v["overlay"].empty:
-                    s = summarize_trades(v["overlay"])
-                    if not s.empty:
-                        r = s.iloc[0].to_dict()
-                        r.update({"config": k, "trades_count": v.get("trades_count", 0)})
-                        summary_rows.append(r)
-            if summary_rows:
-                sdf = pd.DataFrame(summary_rows).sort_values("total_pnl", ascending=False).reset_index(drop=True)
-                st.subheader("Sweep summary (top configs)")
-                st.dataframe(sdf.head(20))
-                st.download_button("Download sweep summary CSV", df_to_csv_bytes(sdf), "sweep_summary.csv", "text/csv")
-            else:
-                st.warning("Sweep returned no runs with trades.")
-    except Exception as exc:
-        logger.exception("Sweep failed: %s", exc)
-        st.error(f"Sweep failed: {exc}")
+            st.warning("Breadth returned no summary rows.")
+    # sweep
+    if run_sweep:
+        st.info("Running grid sweep (light)")
+        rr_vals = [2.0, 2.5, 3.0]  # small set for speed
+        sl_ranges = [(0.02, 0.04), (0.01, 0.03), (0.005, 0.02)]
+        mpt_list = [p_fast, p_slow, p_deep]
+        sweep_results = run_grid_sweep(cands, bars, rr_vals, sl_ranges, mpt_list)
+        st.session_state.last_sweep = sweep_results
+        st.success("Sweep completed.")
+    # 6) export artifacts & models (per-level)
+    st.info("Exporting artifacts and .pt bundles")
+    out_dir = f"artifacts_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+    os.makedirs(out_dir, exist_ok=True)
+    # Save L1/L3 Torch state_dicts + scalers + meta
+    try:
+        trader_path = os.path.join(out_dir, "cascade_trader")
+        os.makedirs(trader_path, exist_ok=True)
+        # L1
+        torch.save(trader.l1.state_dict(), os.path.join(trader_path, "l1_state.pt"))
+        torch.save(trader.l3.state_dict(), os.path.join(trader_path, "l3_state.pt"))
+        # If L2 is xgb, save model; if mlp, save state_dict
+        if trader.l2_backend == "xgb":
+            # xgboost wrapper saving
+            try:
+                trader.l2_model.save_model(os.path.join(trader_path, "l2_xgb.json"))
+            except Exception:
+                joblib.dump(trader.l2_model, os.path.join(trader_path, "l2_xgb.joblib"))
+        else:
+            torch.save(trader.l2_model.state_dict(), os.path.join(trader_path, "l2_mlp_state.pt"))
+        # scalers and metadata
+        with open(os.path.join(trader_path, "scaler_seq.pkl"), "wb") as f:
+            pickle.dump(trader.scaler_seq, f)
+        with open(os.path.join(trader_path, "scaler_tab.pkl"), "wb") as f:
+            pickle.dump(trader.scaler_tab, f)
+        with open(os.path.join(trader_path, "metadata.json"), "w") as f:
+            json.dump(trader.metadata, f, default=str, indent=2)
+    except Exception as e:
+        logger.exception("Saving artifacts failed: %s", e)
+        st.error(f"Saving artifacts failed: {e}")
+    # use export_model_and_metadata to save a .pt bundle for L2 (as an example) and L3 wrapper
+    export_paths = {}
+    try:
+        # create a wrapper-like object for export (minimal)
+        l2_wrapper = type("L2W", (), {})()
+        if trader.l2_backend == "xgb":
+            l2_wrapper.booster = trader.l2_model
+        else:
+            l2_wrapper.booster = None
+            # provide feature_importance stub if desired
+            def fi_stub(): return pd.DataFrame([{"feature":"dummy","gain":1.0}])
+            l2_wrapper.feature_importance = fi_stub
+        paths_l2 = export_model_and_metadata(l2_wrapper, trader.tab_feature_names, {"fit_time": trader.metadata.get("fit_time_sec")}, os.path.join(out_dir, "l2_model"), save_fi=True)
+        export_paths["l2"] = paths_l2
+        # export L3 as .pt bundle
+        l3_wrapper = type("L3W", (), {})()
+        def l3_fi(): return pd.DataFrame([{"feature":"l3_emb","gain":1.0}])
+        l3_wrapper.feature_importance = l3_fi
+        paths_l3 = export_model_and_metadata(l3_wrapper, trader.tab_feature_names, {"fit_time": trader.metadata.get("fit_time_sec")}, os.path.join(out_dir, "l3_model"), save_fi=True)
+        export_paths["l3"] = paths_l3
+        st.success(f"Exported models to {out_dir}")
+        st.write(export_paths)
+        st.session_state.export_paths = export_paths
+    except Exception as e:
+        logger.exception("Export_model_and_metadata failed: %s", e)
+        st.error(f"Export failed: {e}")
+    return {"bars": bars, "cands": cands, "trader": trader, "export": export_paths}
 
-st.sidebar.markdown("### Notes\n- Full pipeline fetches data, computes features, generates candidates, trains confirm model, backtests, and exports artifacts.\n- Enable 'Train per-level' to train and export one confirm model per level concurrently.\n- Exported .pt metadata contains full training metrics (accuracy, f1, roc_auc, confusion matrix, fit_time).")
+# If user clicked the full pipeline button:
+if run_full_pipeline_btn:
+    with st.spinner("Running full pipeline (fetch→cands→train→export) … this may take several minutes"):
+        result = run_full_pipeline()
+        if result is None:
+            st.error("Pipeline failed with no result.")
+        elif "error" in result:
+            st.error(f"Pipeline error: {result.get('error')} - {result.get('exception','')}")
+        else:
+            st.success("Full pipeline completed.")
+            st.write("Artifacts saved:", st.session_state.export_paths)
+            # show final trades if breadth run was executed
+            if run_breadth and "last_breadth" in st.session_state:
+                br = st.session_state.last_breadth
+                st.subheader("Breadth detailed results")
+                for lvl, df in br["detailed"].items():
+                    st.write(lvl, len(df))
+                    if not df.empty:
+                        st.dataframe(df.head(20))
+
+# Chunk 8/8: final notes / help text
+
+st.sidebar.markdown("### Notes\n- Level thresholds adjust the breadth backtest behaviors.\n- Breadth returns per-level trade lists and summaries.\n- Save/Log model after a successful training run.\n\nIf you encounter pickling/export issues for L2 wrappers, consider defining module-level wrapper classes (L2Wrapper/L3Wrapper) instead of dynamic types.")
